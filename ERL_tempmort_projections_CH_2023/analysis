@@ -1,1 +1,217 @@
+##################################################
+### 09 MORTALITY PROJECTIONS - RCP85-SSP5 CMIP5 #
+#################################################
+library(foreach)
+library(doParallel)
+library(npreg)
+library(MASS)
+library(lubridate)
+library(dplyr)
+library(splines)
+library(dlnm)
+library(mixmeta)
+library(abind)
+
+clust <- makeCluster(2)
+registerDoParallel(clust)
+getDoParWorkers()
+parallel::clusterEvalQ(cl   = clust,expr = {.libPaths()})
+parallel::clusterEvalQ(cl   = clust, expr = {require(boot)})
+
+# Load data 
+load("~/OneDrive - Universitaet Bern/CH2018_temp_process/github/SSP585_ZH.Rdata")
+
+# SPECIFICATIONS BLUPS
+varfun <- "ns"
+varper <- c(10,75,90)
+
+# CREATE A COMPLETE DATE VARIABLE FOR STUDY PERIOD
+datecomp <- seq(ymd('1990-01-01'),ymd('2099-12-31'), by = '1 day')
+datecomp <- datecomp[substr(datecomp,6,10)!="02-29"]
+
+#inclusion of GCM's (difference between RCP4.5/RCP8.5)
+incl <- c(1:2)
+
+
+#####################################
+### ARRAYS BUILDING #################
+##-----------------------------------
+# ARRAY SPECIFICATIONS
+agecat <- 2
+gcm <- gcm85[1:2]
+nsim <- 10
+scenario <- c("Baseline","Scen1.5C","Scen2.0C","Scen3.0C","Scen4.0C","Midterm")
+
+RCP_names <- c("RCP85","RCP85_na")
+SSPs <- c("SSP5","SSP5_na")
+
+# DEFINE THE TIME SLICES (PERIODS FOR EACH GCM IN EACH SCENARIO)
+period_RCP85 <- array(NA,dim=c(2,length(gcm85),length(scenario)),
+                      dimnames=list(c("start","end"),gcm85,scenario))
+
+# Baseline
+#21 years
+period_RCP85[,,"Baseline"] <- 1900+c(90,110)
+period_RCP85[,,"Scen1.5C"] <- 2000+c(13,33)
+period_RCP85[,,"Scen2.0C"] <- 2000+c(28,48)
+period_RCP85[,,"Scen3.0C"] <- 2000+c(50,70)
+period_RCP85[,,"Scen4.0C"] <- 2000+c(71,91)
+period_RCP85[,,"Midterm"] <- 2000+c(40,60)
+
+
+tmeanavg  <- array(NA,c(nrow(districts),length(gcm85),2,length(scenario)),
+                   dimnames=list(districts$districts,gcm85,c("RCP8.5","RCP8.5_na"),scenario))
+
+
+andistrict <- afdistrict <- array(NA,dim=c(nrow(districts),3,2,2,3,agecat,length(gcm)+1,
+                                           length(scenario)),dimnames=list(districts$districts,c("est","ci.l","ci.u"),c("RCP85","RCP85_na"),
+                                                                           c("abs","rel"),c("tot","cold","heat"),c("u75","ab75"),c("enseble",gcm),scenario))
+
+ancountry <- afcountry <- array(NA,dim=c(3,2,2,3,agecat,
+                                         length(gcm)+1,length(scenario)),dimnames=list(c("est","ci.l","ci.u"), c("RCP85","RCP85_na"),
+                                                                                       c("abs","rel"),c("tot","cold","heat"),c("u75","ab75"), c("enseble",gcm),scenario))
+
+ancitysim <- array(NA,dim=c(nrow(districts),1,2,3,agecat,length(gcm),
+                            length(scenario),nsim+1))
+
+deathbase  <- array(NA,dim=c(nrow(districts),2,2,length(scenario)),
+                    dimnames=list(districts$districts,c("u75","ab75"),
+                                  c("RCP85","RCP85_na"),scenario))
+
+## CREATE LISTS
+#---------------
+# PERIOD WARMING SELECTION BY RCP 
+period      <- period_RCP85
+
+### CREATE AGE LIST BLUPS 
+blup_u75 <- blup[1]
+blup_ab75 <- blup[2]
+blups_all <- list(blup_u75,blup_ab75)
+
+
+### CREATEAGGE LIST MINTEMP
+mintemp_u75 <- mintempdistrict[1]
+mintemp_ab75 <- mintempdistrict[2]
+mintemp_all <- list(mintemp_u75,mintemp_ab75)
+
+
+
+mbind <- function(ar1,ar2) {
+  output <- abind(ar1,ar2,along=2)
+  return(output)
+}
+
+
+##################################################
+### ANALYSIS  ####################################
+################################################
+system.time(ancitysim_85<- foreach(c = 1:2, .combine = mbind, .packages=c('abind','MASS','npreg','lubridate','dplyr','splines','dlnm','mixmeta')) %dopar% {
+  
+  SSPs_sel <- SSPs[c]
+  
+  # LOOP ACROSS AGE GROUPS (<75 AND >75)
+  for(a in 1:2) {
+    
+    #1 = u75, 2=ab75
+    # cat(a,"") #tracking progress of loop execution
+    
+    #CENTER BY AGE GROUP
+    mintempdistrict <- mintemp_all[[a]]
+    
+    #SELECT BLUPS BY AGE GROUP
+    blups  <- blups_all[[a]]
+    
+    
+    # LOOP ACROSS DISTRICTS 
+    for(i in 1:1) {
+      
+      # PRINT
+      #cat(i,"") #tracking progress of loop execution
+      
+      tmeanproj <- RCP_total
+      
+      # DEFINE ARGVAR (AS IN ESTIMATION), CENTERING AND COEF-VCOV
+      argvar <- list(fun=varfun,knots=quantile(dlist$TabSD,varper/100,
+                                               na.rm=T),Bound=range(dlist$TabSD,na.rm=T))
+    #  if(!is.null(vardegree)) argvar$degree <- vardegree
+      
+      cen <- mintempdistrict
+  
+      # EXTRACT PARAMETERS
+      coef <- blups$Zürich$blup
+      vcov <- blups$Zürich$vcov
+      
+      # SAMPLE COEF ASSUMING A MULTIVARIATE NORMAL DISTRIBUTION
+      set.seed(13041975)
+      coefsim <- mvrnorm(nsim,coef,vcov)
+      
+      # LOOP ACROSS GCMS 
+      for(j in seq(incl)) {
+        
+        #cat(j,"") #Tracking progress purpose
+        f <- incl[j]
+        
+        # DERIVE THE CENTERED BASIS
+        bvar <- do.call(onebasis,c(list(x=tmeanproj[,j+1]),argvar))
+        cenvec <- do.call(onebasis,c(list(x=cen),argvar))
+        bvarcen <- scale(bvar,center=cenvec,scale=F)
+        
+        # INDICATOR FOR COLD/HEAT DAYS
+        indheat <- tmeanproj[,j+1]>cen
+        
+        an <- (1-exp(-bvarcen%*%coef))*deathporj_sel[[c]][,a+2]
+        
+        
+        # LOOP ACROSS TIME PERIODS
+        for(r in seq(1:6)) {
+          
+          
+          # DEFINE INDICATOR FOR PERIOD CONSISTENT WITH SCENARIO
+          ind <- substr(tmeanproj$Date,1,4) %in% (period[1,j,r]:period[2,j,r])
+          which(ind, arr.ind = FALSE, useNames = TRUE)
+          
+          # STORE THE AVERAGE TEMPERATURE
+          
+          tmeanavg[i,j,c,r] <- mean(tmeanproj[ind,j+1])
+          
+          ind_mort <- substr(deathporj_sel[[c]]$date,1,4)%in%(period[1,j,r]:period[2,j,r])
+          which(ind_mort, arr.ind = FALSE, useNames = TRUE)
+          
+          deathbase[i,a,c,r] <- sum(deathporj_sel[[c]][ind_mort,a+2])
+          
+          # STORE THE ATTRIBUTABLE MORTALITY
+          #i=DISTRICT, c=RCP,a=AGE,1-2=Abs/REL, 1-3=total/heat/cold, f=inclusion,r=warming period, s=simulation
+          ancitysim[i,1,1,1,a,f,r,1] <- sum(an[ind])
+          ancitysim[i,1,1,2,a,f,r,1] <- sum(an[!indheat & ind])
+          ancitysim[i,1,1,3,a,f,r,1] <- sum(an[indheat & ind])
+          
+          # LOOP ACROSS ITERATIONS
+          for(s in seq(nsim)) {
+            
+            # COMPUTE THE DAILY CONTRIBUTIONS OF ATTRIBUTABLE DEATHS
+            ansim <- (1-exp(-bvarcen%*%coefsim[s,]))*deathporj_sel[[c]][,a+2]
+            
+            #   STORE THE ATTRIBUTABLE MORTALITY
+            #DISTRICT/RCP/ABS/EST,AGE/GCM/PERIOD/SIM
+            ancitysim[i,1,1,1,a,f,r,s+1] <- sum(ansim[ind])
+            ancitysim[i,1,1,2,a,f,r,s+1] <- sum(ansim[!indheat & ind])
+            ancitysim[i,1,1,3,a,f,r,s+1] <- sum(ansim[indheat & ind])
+            
+            
+          }
+        }  
+      }
+    }
+  }
+  dimnames(ancitysim) <- list(districts$districts,RCP_names[c],
+                              c("abs","rel"),c("tot","cold","heat"),c("u75","ab75"),gcm,scenario, c("est",paste0("sim",seq(nsim))))
+}
+)
+stopCluster(clust)
+
+str(ancitysim)
+ancitysim[i,1,1,3,2,,,1]/21
+
+
+
 
